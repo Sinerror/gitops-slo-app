@@ -1,0 +1,145 @@
+# CI: тесты -> сборка -> скан Trivy -> push в GHCR -> коммит тега в GitOps-репозиторий (staging).
+# Прод обновляется отдельным workflow promote.yaml (вручную, после зелёного staging).
+#
+# Секрет GITOPS_TOKEN: fine-grained PAT с правом Contents: Read and write
+# только на репозиторий Sinerror/gitops-slo-platform.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", ".github/workflows/ci.yaml"]
+  pull_request:
+    paths: ["src/**", ".github/workflows/ci.yaml"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/sinerror
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # В апстрим-коде checkoutservice есть замечания go vet (copylocks) — не наш код,
+          # поэтому vet для него выключен, а для order-consumer — обязателен.
+          - service: checkoutservice
+            test_flags: -vet=off
+          - service: order-consumer
+            test_flags: ""
+    defaults:
+      run:
+        working-directory: src/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/${{ matrix.service }}/go.mod
+          cache-dependency-path: src/${{ matrix.service }}/go.sum
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go' | grep -v '^genproto/'))
+          if [ -n "$unformatted" ]; then echo "не отформатировано: $unformatted"; exit 1; fi
+      - name: go vet
+        if: matrix.service == 'order-consumer'
+        run: go vet ./...
+      - name: go test
+        run: go test ${{ matrix.test_flags }} -race -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [checkoutservice, order-consumer]
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # 1. Собрать локально (без push), чтобы просканировать до публикации
+      - name: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/${{ matrix.service }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # 2. Trivy из официального образа, закреплённого по digest (trivy-action не используем)
+      - name: trivy scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            "$IMAGE_PREFIX/${{ matrix.service }}:${{ steps.meta.outputs.tag }}"
+
+      # 3. Push только при успешном скане
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push
+        if: github.event_name != 'pull_request'
+        run: docker push "$IMAGE_PREFIX/${{ matrix.service }}:${{ steps.meta.outputs.tag }}"
+
+  deploy-staging:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions: {}
+    concurrency:
+      group: gitops-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Sinerror/gitops-slo-platform
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: platform
+      - name: bump image tags in envs/staging
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_TIME: ${{ github.event.head_commit.timestamp }}
+        working-directory: platform
+        run: |
+          sed -i -E "/^  (checkoutservice|orderConsumer):$/{n;s/^(    tag: ).*/\1\"${TAG}\"/}" envs/staging/values.yaml
+          git diff --stat
+          if git diff --quiet; then echo "тег уже стоит"; exit 0; fi
+          git config user.name  "gitops-slo-ci"
+          git config user.email "gitops-slo-ci@users.noreply.github.com"
+          # Трейлеры нужны для расчёта lead time (scripts/dora.sh)
+          git commit -am "staging: ${TAG}" \
+            -m "Source-Commit: ${{ github.repository }}@${SOURCE_SHA}" \
+            -m "Source-Commit-Time: ${SOURCE_TIME}"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && break; sleep 3; done

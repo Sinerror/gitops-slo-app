@@ -1,0 +1,45 @@
+# Промоушн staging -> prod: копирует теги образов из envs/staging в envs/prod.
+# Запускается вручную после того, как ArgoCD синхронизировал staging и smoke-тест прошёл.
+# Откат = запуск с тегом предыдущей версии (или git revert коммита в gitops-репозитории).
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег для prod (пусто = взять текущий из staging)"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: gitops-prod
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Sinerror/gitops-slo-platform
+          token: ${{ secrets.GITOPS_TOKEN }}
+      - name: copy tags staging -> prod
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(awk '/^  checkoutservice:$/{getline; gsub(/[" ]|tag:/,""); print; exit}' envs/staging/values.yaml)
+          fi
+          echo "promote tag: $TAG"
+          case "$TAG" in sha-*|dev) ;; *) echo "неожиданный тег: $TAG"; exit 1 ;; esac
+          sed -i -E "/^  (checkoutservice|orderConsumer):$/{n;s/^(    tag: ).*/\1\"${TAG}\"/}" envs/prod/values.yaml
+          git diff
+          if git diff --quiet; then echo "prod уже на $TAG"; exit 0; fi
+          git config user.name  "gitops-slo-ci"
+          git config user.email "gitops-slo-ci@users.noreply.github.com"
+          git commit -am "prod: ${TAG}" -m "Promoted-By: ${{ github.actor }}"
+          git push -q
