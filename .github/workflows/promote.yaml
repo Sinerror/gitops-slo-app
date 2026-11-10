@@ -26,6 +26,7 @@ jobs:
         with:
           repository: Sinerror/gitops-slo-platform
           token: ${{ secrets.GITOPS_TOKEN }}
+          fetch-depth: 0   # нужна история: трейлеры Source-Commit* берём из коммита staging
       - name: copy tags staging -> prod
         env:
           INPUT_TAG: ${{ inputs.tag }}
@@ -41,5 +42,8 @@ jobs:
           if git diff --quiet; then echo "prod уже на $TAG"; exit 0; fi
           git config user.name  "gitops-slo-ci"
           git config user.email "gitops-slo-ci@users.noreply.github.com"
-          git commit -am "prod: ${TAG}" -m "Promoted-By: ${{ github.actor }}"
+          # Переносим трейлеры исходного коммита из "staging: <tag>", чтобы scripts/dora.sh
+          # считал lead time до prod от того же момента, что и до staging
+          TRAILERS=$(git log -1 --format=%B --fixed-strings --grep="staging: ${TAG}" | grep -E '^Source-Commit(-Time)?: ' || true)
+          git commit -am "prod: ${TAG}" -m "Promoted-By: ${{ github.actor }}" ${TRAILERS:+-m "$TRAILERS"}
           git push -q

@@ -138,7 +138,7 @@ jobs:
           if git diff --quiet; then echo "тег уже стоит"; exit 0; fi
           git config user.name  "gitops-slo-ci"
           git config user.email "gitops-slo-ci@users.noreply.github.com"
-          # Трейлеры нужны для расчёта lead time (scripts/dora.sh)
+          # Трейлеры нужны для расчёта lead time (scripts/dora.sh); promote.yaml переносит их в коммит prod
           git commit -am "staging: ${TAG}" \
             -m "Source-Commit: ${{ github.repository }}@${SOURCE_SHA}" \
             -m "Source-Commit-Time: ${SOURCE_TIME}"
